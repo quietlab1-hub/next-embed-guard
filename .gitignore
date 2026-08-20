@@ -1,0 +1,4 @@
+node_modules/
+.test-build/
+*.tsbuildinfo
+.DS_Store

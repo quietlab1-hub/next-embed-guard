@@ -1,6 +1,7 @@
 {
   "name": "next-embed-guard",
   "version": "0.1.0",
+  "private": true,
   "description": "Per-tenant iframe embedding for Next.js middleware: fail-closed frame-ancestors from an allowlist you own.",
   "license": "MIT",
   "type": "module",
@@ -21,7 +22,14 @@
     "security"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "pretest": "tsc -p tsconfig.test.json",
+    "test": "node --test .test-build/",
+    "test:strip": "node --test --experimental-strip-types src/embed-guard.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "typescript": "^5.4.0"
   },
   "peerDependencies": {
     "next": ">=13"

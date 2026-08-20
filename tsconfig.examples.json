@@ -1,0 +1,6 @@
+{
+  // Typechecks `examples/`. Needs `next` installed (peer dependency):
+  //   npm i -D next && npx tsc -p tsconfig.examples.json
+  "extends": "./tsconfig.json",
+  "include": ["src", "examples"]
+}

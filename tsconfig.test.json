@@ -1,0 +1,12 @@
+{
+  // Node 20 cannot run TypeScript directly, so `npm test` compiles the sources
+  // (library + tests) to plain ESM and runs `node --test` over the output.
+  // On Node >= 22.6 the build step is optional: see the `test:strip` script.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": ".test-build",
+    "sourceMap": true
+  },
+  "include": ["src"]
+}

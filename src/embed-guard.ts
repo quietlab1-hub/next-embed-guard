@@ -69,6 +69,26 @@ export interface EmbedGuardOptions {
    */
   minTenantIdLength?: number
 
+  /**
+   * Reject tenant ids longer than this before hitting the data source. Caps
+   * the work an attacker can push onto your lookup with a very long URL
+   * segment. Default: `128`.
+   */
+  maxTenantIdLength?: number
+
+  /**
+   * Positive validation for the tenant id. When set, an id that does not match
+   * is treated as "not an embed route" and the data source is never called —
+   * so junk never reaches your database as a query parameter.
+   *
+   * Example for opaque hex tokens: `/^[a-f0-9]{32,64}$/`.
+   *
+   * Anchor the pattern (`^…$`), and prefer a non-global regex: `test()` on a
+   * `/g` or `/y` pattern is stateful. (The guard resets `lastIndex` before each
+   * test, so a global pattern still behaves correctly here.)
+   */
+  tenantIdPattern?: RegExp
+
   /** Cache TTL for resolved origin lists, in ms. Default: `60_000`. */
   cacheTtlMs?: number
 
@@ -112,6 +132,8 @@ export interface EmbedDecision {
 
 /** Minimal structural type for a mutable header bag (`Headers`, or a mock). */
 export interface MutableHeaders {
+  /** Returns `null` when the header is absent, like the DOM `Headers` API. */
+  get(name: string): string | null
   set(name: string, value: string): void
   delete(name: string): void
 }
@@ -126,27 +148,78 @@ export interface ResponseWithHeaders {
    ============================================================ */
 
 /**
+ * One DNS label: alphanumeric, hyphens allowed inside but not at either end,
+ * 63 characters max. Internationalized names arrive here already punycoded by
+ * `URL`, so ASCII is enough.
+ */
+const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i
+
+/** Bracketed IPv6 literal as `URL` reports it in `hostname`, e.g. `[::1]`. */
+const IPV6_HOST = /^\[[0-9a-f:.]{2,45}\]$/i
+
+/**
+ * Positive validation of a host: an IPv6 literal, or dot-separated DNS labels
+ * (which also covers IPv4 and `localhost`).
+ *
+ * Deliberately an allowlist, not a denylist. `URL` is permissive — it accepts
+ * hosts containing characters that are legal in a URL but have no business in
+ * a CSP source, and its parsing quirks differ between runtimes. Anything that
+ * is not recognizably a host is rejected rather than escaped.
+ *
+ * Note that underscores and trailing dots are rejected too: both appear in DNS
+ * but neither belongs in a browser-facing origin.
+ */
+function isValidHost(hostname: string): boolean {
+  if (!hostname) return false
+  if (hostname.startsWith('[')) {
+    return IPV6_HOST.test(hostname) && hostname.includes(':')
+  }
+  if (hostname.length > 253) return false
+  const labels = hostname.split('.')
+  return labels.every((label) => DNS_LABEL.test(label))
+}
+
+/**
  * Normalize one user-supplied entry (`"example.com"`, `"https://example.com/"`)
  * into an origin string (`"https://example.com"`) that is safe to interpolate
  * into a CSP or CORS header. Returns `null` when the input contains unsafe
- * characters or is not parsable.
+ * characters, is not parsable, or does not resolve to a well-formed host.
  *
  * Anti-injection: whitespace, quotes, semicolons, backslashes, CR/LF and angle
  * brackets are rejected outright — CSP separates sources with a single space,
  * so a value containing any of those could otherwise smuggle in extra
  * directives or sources.
  *
- * A bare host is upgraded to `https://`. Path, query and fragment are dropped:
- * only `scheme://host[:port]` survives.
+ * A bare host is upgraded to `https://`. Path, query, fragment, credentials
+ * are dropped: only `scheme://host[:port]` survives. Only `http:` and `https:`
+ * are accepted; the parsed host must additionally pass {@link isValidHost}.
  */
 export function normalizeOrigin(input: unknown): string | null {
   if (typeof input !== 'string') return null
   const trimmed = input.trim()
   if (!trimmed) return null
   if (/[\s'";\\<>]/.test(trimmed)) return null
-  const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`
+
+  // Distinguish "bare host, add https" from "explicit scheme, must be http(s)".
+  // Blindly prefixing would turn `ftp://example.com` into
+  // `https://ftp://example.com`, which URL happily reads as host `ftp` — a
+  // silently wrong origin. A colon followed by digits is a port, not a scheme,
+  // so `example.com:8443` still counts as a bare host.
+  const schemeMatch = /^([a-z][a-z0-9+.-]*):/i.exec(trimmed)
+  const hasScheme = schemeMatch !== null && !/^\d/.test(trimmed.slice(schemeMatch[0].length))
+  if (hasScheme) {
+    const scheme = (schemeMatch as RegExpExecArray)[1]!.toLowerCase()
+    if (scheme !== 'http' && scheme !== 'https') return null
+  }
+  const withScheme = hasScheme ? trimmed : `https://${trimmed}`
+
   try {
     const u = new URL(withScheme)
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null
+    // Credentials in the input would be dropped silently by `u.host`; treat
+    // them as malformed rather than quietly accepting a different origin.
+    if (u.username || u.password) return null
+    if (!isValidHost(u.hostname)) return null
     // Only scheme + host[:port]; no path/query/fragment.
     return `${u.protocol}//${u.host}`
   } catch {
@@ -183,6 +256,50 @@ export function buildFrameAncestors(origins: string[]): string {
     : SAME_ORIGIN_CSP
 }
 
+/**
+ * Splice a `frame-ancestors` directive into an existing CSP header value,
+ * replacing any `frame-ancestors` already present and leaving every other
+ * directive untouched, in order.
+ *
+ * Your app may well set its own CSP (`default-src`, `script-src`, a nonce…).
+ * Overwriting the whole header to control framing would silently drop those
+ * protections, so this module only ever edits the one directive it owns.
+ *
+ * @param existing current header value, or `null`/`''` when absent
+ * @param frameAncestors the full directive, e.g. `frame-ancestors 'self'`
+ */
+export function mergeFrameAncestors(
+  existing: string | null | undefined,
+  frameAncestors: string,
+): string {
+  if (!existing || !existing.trim()) return frameAncestors
+  const kept = existing
+    .split(';')
+    .map((directive) => directive.trim())
+    .filter((directive) => directive.length > 0)
+    .filter((directive) => {
+      const name = directive.split(/\s+/)[0] ?? ''
+      return name.toLowerCase() !== 'frame-ancestors'
+    })
+  kept.push(frameAncestors)
+  return kept.join('; ')
+}
+
+/**
+ * Write `frameAncestors` onto the response, keeping every other directive of
+ * an already-present `Content-Security-Policy`.
+ */
+function setFrameAncestors(
+  response: ResponseWithHeaders,
+  frameAncestors: string,
+): void {
+  const existing = response.headers.get('Content-Security-Policy')
+  response.headers.set(
+    'Content-Security-Policy',
+    mergeFrameAncestors(existing, frameAncestors),
+  )
+}
+
 /* ============================================================
    Guard
    ============================================================ */
@@ -195,6 +312,7 @@ interface CacheEntry {
 const DEFAULTS = {
   pathPrefix: '/embed/',
   minTenantIdLength: 1,
+  maxTenantIdLength: 128,
   cacheTtlMs: 60_000,
   maxCacheEntries: 1000,
   enforceFallback: true,
@@ -221,10 +339,15 @@ export interface EmbedGuard {
    * - Path not matched: the response is left untouched.
    * - Matched and allowed: `X-Frame-Options` is removed (it has no per-origin
    *   form and would otherwise veto the CSP in older browsers) and
-   *   `Content-Security-Policy: frame-ancestors 'self' <origins...>` is set.
-   * - Matched and not allowed: with `enforceFallback` (default), the
-   *   restrictive pair is written explicitly; otherwise nothing is touched and
-   *   the app's global `SAMEORIGIN` stands.
+   *   `frame-ancestors 'self' <origins...>` is spliced into the CSP.
+   * - Matched and not allowed: with `enforceFallback` (default),
+   *   `X-Frame-Options: SAMEORIGIN` is set and `frame-ancestors 'self'` is
+   *   spliced in; otherwise nothing is touched and the app's global
+   *   `SAMEORIGIN` stands.
+   *
+   * In both writing branches an existing `Content-Security-Policy` is
+   * preserved: only its `frame-ancestors` directive is replaced (see
+   * {@link mergeFrameAncestors}).
    */
   apply(pathname: string, response: ResponseWithHeaders): Promise<EmbedDecision>
 
@@ -255,6 +378,8 @@ export function createEmbedGuard(options: EmbedGuardOptions): EmbedGuard {
   const getAllowedOrigins = options.getAllowedOrigins
   const pathPrefix = options.pathPrefix ?? DEFAULTS.pathPrefix
   const minTenantIdLength = options.minTenantIdLength ?? DEFAULTS.minTenantIdLength
+  const maxTenantIdLength = options.maxTenantIdLength ?? DEFAULTS.maxTenantIdLength
+  const tenantIdPattern = options.tenantIdPattern
   const cacheTtlMs = options.cacheTtlMs ?? DEFAULTS.cacheTtlMs
   const maxCacheEntries = options.maxCacheEntries ?? DEFAULTS.maxCacheEntries
   const enforceFallback = options.enforceFallback ?? DEFAULTS.enforceFallback
@@ -272,17 +397,35 @@ export function createEmbedGuard(options: EmbedGuardOptions): EmbedGuard {
 
   const cache = new Map<string, CacheEntry>()
 
+  /**
+   * Shape checks that run BEFORE the data source is consulted: an id that is
+   * too short, too long, or off-pattern is simply not an embed route. Nothing
+   * is looked up, nothing is cached, and the response falls back to
+   * same-origin like any other non-matching path.
+   */
+  function isAcceptableTenantId(tenantId: string): boolean {
+    if (tenantId.length < minTenantIdLength) return false
+    if (tenantId.length > maxTenantIdLength) return false
+    if (tenantIdPattern) {
+      // `test()` advances `lastIndex` on /g and /y patterns, which would make
+      // consecutive calls with the same id disagree. Reset first.
+      tenantIdPattern.lastIndex = 0
+      if (!tenantIdPattern.test(tenantId)) return false
+    }
+    return true
+  }
+
   function extractTenantId(pathname: string): string | null {
     if (options.extractTenantId) {
       const custom = options.extractTenantId(pathname)
       if (typeof custom !== 'string') return null
       const trimmed = custom.trim()
-      return trimmed.length >= minTenantIdLength ? trimmed : null
+      return isAcceptableTenantId(trimmed) ? trimmed : null
     }
     const m = prefixPattern.exec(pathname)
     if (!m) return null
     const tenantId = m[1]
-    if (!tenantId || tenantId.length < minTenantIdLength) return null
+    if (!tenantId || !isAcceptableTenantId(tenantId)) return null
     return tenantId
   }
 
@@ -363,16 +506,13 @@ export function createEmbedGuard(options: EmbedGuardOptions): EmbedGuard {
       // still honored, would override the CSP. Remove it and let
       // frame-ancestors be the single source of truth for this response.
       response.headers.delete('X-Frame-Options')
-      response.headers.set(
-        'Content-Security-Policy',
-        buildFrameAncestors(decision.origins),
-      )
+      setFrameAncestors(response, buildFrameAncestors(decision.origins))
       return decision
     }
 
     if (enforceFallback) {
       response.headers.set('X-Frame-Options', 'SAMEORIGIN')
-      response.headers.set('Content-Security-Policy', SAME_ORIGIN_CSP)
+      setFrameAncestors(response, SAME_ORIGIN_CSP)
     }
     return decision
   }
